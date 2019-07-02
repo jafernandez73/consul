@@ -155,6 +155,29 @@ func TestUpstreamNodes(t testing.T) structs.CheckServiceNodes {
 	}
 }
 
+func TestUpstreamNodesAlternate(t testing.T) structs.CheckServiceNodes {
+	return structs.CheckServiceNodes{
+		structs.CheckServiceNode{
+			Node: &structs.Node{
+				ID:         "alt-test1",
+				Node:       "alt-test1",
+				Address:    "10.20.1.1",
+				Datacenter: "dc1",
+			},
+			Service: structs.TestNodeService(t),
+		},
+		structs.CheckServiceNode{
+			Node: &structs.Node{
+				ID:         "alt-test2",
+				Node:       "alt-test2",
+				Address:    "10.20.1.2",
+				Datacenter: "dc1",
+			},
+			Service: structs.TestNodeService(t),
+		},
+	}
+}
+
 func TestGatewayNodesDC2(t testing.T) structs.CheckServiceNodes {
 	return structs.CheckServiceNodes{
 		structs.CheckServiceNode{
@@ -377,6 +400,123 @@ func TestConfigSnapshot(t testing.T) *ConfigSnapshot {
 		},
 		Datacenter: "dc1",
 	}
+}
+
+// TestConfigSnapshotDiscoveryChain returns a fully populated snapshot using a discovery chain
+func TestConfigSnapshotDiscoveryChain(t testing.T) *ConfigSnapshot {
+	return testConfigSnapshotDiscoveryChain(t, "simple")
+}
+
+func TestConfigSnapshotDiscoveryChainWithFailover(t testing.T) *ConfigSnapshot {
+	return testConfigSnapshotDiscoveryChain(t, "failover")
+}
+
+func testConfigSnapshotDiscoveryChain(t testing.T, variation string) *ConfigSnapshot {
+	roots, leaf := TestCerts(t)
+
+	// Initialize a default group resolver for "db"
+	dbResolverEntry := &structs.ServiceResolverConfigEntry{
+		Kind: structs.ServiceResolver,
+		Name: "db",
+	}
+	dbTarget := structs.DiscoveryTarget{
+		Service:    "db",
+		Namespace:  "default",
+		Datacenter: "dc1",
+	}
+	dbResolverNode := &structs.DiscoveryGraphNode{
+		Type: structs.DiscoveryGraphNodeTypeGroupResolver,
+		Name: "db",
+		GroupResolver: &structs.DiscoveryGroupResolver{
+			Definition: dbResolverEntry,
+			Default:    true,
+			Target:     dbTarget,
+		},
+	}
+
+	dbChain := &structs.CompiledDiscoveryChain{
+		ServiceName: "db",
+		Namespace:   "default",
+		Datacenter:  "dc1",
+		Protocol:    "tcp",
+		Node:        dbResolverNode,
+		GroupResolverNodes: map[structs.DiscoveryTarget]*structs.DiscoveryGraphNode{
+			dbTarget: dbResolverNode,
+		},
+		Resolvers: map[string]*structs.ServiceResolverConfigEntry{
+			"db": dbResolverEntry,
+		},
+		Targets: []structs.DiscoveryTarget{
+			dbTarget,
+		},
+	}
+
+	snap := &ConfigSnapshot{
+		Kind:    structs.ServiceKindConnectProxy,
+		Service: "web-sidecar-proxy",
+		ProxyID: "web-sidecar-proxy",
+		Address: "0.0.0.0",
+		Port:    9999,
+		Proxy: structs.ConnectProxyConfig{
+			DestinationServiceID:   "web",
+			DestinationServiceName: "web",
+			LocalServiceAddress:    "127.0.0.1",
+			LocalServicePort:       8080,
+			Config: map[string]interface{}{
+				"foo": "bar",
+			},
+			Upstreams: structs.TestUpstreams(t),
+		},
+		Roots: roots,
+		ConnectProxy: configSnapshotConnectProxy{
+			Leaf: leaf,
+			DiscoveryChain: map[string]*structs.CompiledDiscoveryChain{
+				"db": dbChain,
+			},
+			WatchedUpstreamEndpoints: map[string]map[structs.DiscoveryTarget]structs.CheckServiceNodes{
+				"db": map[structs.DiscoveryTarget]structs.CheckServiceNodes{
+					dbTarget: TestUpstreamNodes(t),
+				},
+			},
+		},
+		Datacenter: "dc1",
+	}
+
+	switch variation {
+	case "simple":
+	case "failover":
+		// Add in a second resolver config but no group resolver for "fail"
+		failResolverEntry := &structs.ServiceResolverConfigEntry{
+			Kind: structs.ServiceResolver,
+			Name: "fail",
+		}
+		failTarget := structs.DiscoveryTarget{
+			Service:    "fail",
+			Namespace:  "default",
+			Datacenter: "dc1",
+		}
+
+		dbChain.Resolvers["fail"] = failResolverEntry
+		dbChain.Targets = append(dbChain.Targets, failTarget)
+
+		// Update the definition of "db" to reference "fail" as a failover target.
+		dbResolverNode.GroupResolver.Failover = &structs.DiscoveryFailover{
+			Definition: &structs.ServiceResolverFailover{
+				Service: "fail",
+			},
+			Targets: []structs.DiscoveryTarget{
+				failTarget,
+			},
+		}
+
+		snap.ConnectProxy.WatchedUpstreamEndpoints["db"][failTarget] =
+			TestUpstreamNodesAlternate(t)
+	default:
+		t.Fatalf("unexpected variation: %q", variation)
+		return nil
+	}
+
+	return snap
 }
 
 func TestConfigSnapshotMeshGateway(t testing.T) *ConfigSnapshot {
