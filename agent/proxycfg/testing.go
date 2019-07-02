@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/consul/agent/cache"
 	cachetype "github.com/hashicorp/consul/agent/cache-types"
 	"github.com/hashicorp/consul/agent/connect"
+	"github.com/hashicorp/consul/agent/consul/discoverychain"
 	"github.com/hashicorp/consul/agent/structs"
 	"github.com/mitchellh/go-testing-interface"
 	"github.com/stretchr/testify/require"
@@ -414,41 +415,53 @@ func TestConfigSnapshotDiscoveryChainWithFailover(t testing.T) *ConfigSnapshot {
 func testConfigSnapshotDiscoveryChain(t testing.T, variation string) *ConfigSnapshot {
 	roots, leaf := TestCerts(t)
 
-	// Initialize a default group resolver for "db"
-	dbResolverEntry := &structs.ServiceResolverConfigEntry{
-		Kind: structs.ServiceResolver,
-		Name: "db",
+	// Compile a chain.
+	entries := structs.NewDiscoveryChainConfigEntries()
+	switch variation {
+	case "simple":
+		entries.AddResolvers(
+			&structs.ServiceResolverConfigEntry{
+				Kind:           structs.ServiceResolver,
+				Name:           "db",
+				ConnectTimeout: 33 * time.Second,
+			},
+		)
+	case "failover":
+		entries.AddResolvers(
+			&structs.ServiceResolverConfigEntry{
+				Kind:           structs.ServiceResolver,
+				Name:           "db",
+				ConnectTimeout: 33 * time.Second,
+				Failover: map[string]structs.ServiceResolverFailover{
+					"*": {
+						Service: "fail",
+					},
+				},
+			},
+		)
+	default:
+		t.Fatalf("unexpected variation: %q", variation)
+		return nil
 	}
+
+	dbChain, err := discoverychain.Compile(discoverychain.CompileRequest{
+		ServiceName:       "db",
+		CurrentNamespace:  "default",
+		CurrentDatacenter: "dc1",
+		InferDefaults:     true,
+		Entries:           entries,
+	})
+	require.NoError(t, err)
+
 	dbTarget := structs.DiscoveryTarget{
 		Service:    "db",
 		Namespace:  "default",
 		Datacenter: "dc1",
 	}
-	dbResolverNode := &structs.DiscoveryGraphNode{
-		Type: structs.DiscoveryGraphNodeTypeGroupResolver,
-		Name: "db",
-		GroupResolver: &structs.DiscoveryGroupResolver{
-			Definition: dbResolverEntry,
-			Default:    true,
-			Target:     dbTarget,
-		},
-	}
-
-	dbChain := &structs.CompiledDiscoveryChain{
-		ServiceName: "db",
-		Namespace:   "default",
-		Datacenter:  "dc1",
-		Protocol:    "tcp",
-		Node:        dbResolverNode,
-		GroupResolverNodes: map[structs.DiscoveryTarget]*structs.DiscoveryGraphNode{
-			dbTarget: dbResolverNode,
-		},
-		Resolvers: map[string]*structs.ServiceResolverConfigEntry{
-			"db": dbResolverEntry,
-		},
-		Targets: []structs.DiscoveryTarget{
-			dbTarget,
-		},
+	failTarget := structs.DiscoveryTarget{
+		Service:    "fail",
+		Namespace:  "default",
+		Datacenter: "dc1",
 	}
 
 	snap := &ConfigSnapshot{
@@ -485,30 +498,6 @@ func testConfigSnapshotDiscoveryChain(t testing.T, variation string) *ConfigSnap
 	switch variation {
 	case "simple":
 	case "failover":
-		// Add in a second resolver config but no group resolver for "fail"
-		failResolverEntry := &structs.ServiceResolverConfigEntry{
-			Kind: structs.ServiceResolver,
-			Name: "fail",
-		}
-		failTarget := structs.DiscoveryTarget{
-			Service:    "fail",
-			Namespace:  "default",
-			Datacenter: "dc1",
-		}
-
-		dbChain.Resolvers["fail"] = failResolverEntry
-		dbChain.Targets = append(dbChain.Targets, failTarget)
-
-		// Update the definition of "db" to reference "fail" as a failover target.
-		dbResolverNode.GroupResolver.Failover = &structs.DiscoveryFailover{
-			Definition: &structs.ServiceResolverFailover{
-				Service: "fail",
-			},
-			Targets: []structs.DiscoveryTarget{
-				failTarget,
-			},
-		}
-
 		snap.ConnectProxy.WatchedUpstreamEndpoints["db"][failTarget] =
 			TestUpstreamNodesAlternate(t)
 	default:
